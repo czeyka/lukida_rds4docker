@@ -1,0 +1,37 @@
+# ============================================================================
+# DOCKER COMPOSE OVERRIDE - DEVELOPMENT MODE
+# ============================================================================
+# This file can be used for local development overrides
+# Copy to docker-compose.override.yml to enable
+# ============================================================================
+
+version: '3.8'
+
+services:
+  php-apache:
+    # Mount full Lukida directory for development (not read-only)
+    volumes:
+      - ./lukida:/var/www/html:rw
+      - ./rds-config:/var/www/html/libraries/lukida_newlibrary:rw
+      - ./logs/apache2:/var/log/apache2:rw
+      - ./logs/php:/var/log/php:rw
+      - ./logs/lukida:/var/www/html/libraries/lukida_newlibrary/logs:rw
+    
+    # Expose debug port
+    ports:
+      - "127.0.0.1:9003:9003"
+    
+    # Enable xdebug in development
+    environment:
+      XDEBUG_MODE: debug
+      XDEBUG_CONFIG: client_host=host.docker.internal
+
+  mariadb:
+    # Expose MariaDB for local development tools
+    ports:
+      - "127.0.0.1:3306:3306"
+
+  solr:
+    # Expose Solr admin interface for development
+    ports:
+      - "127.0.0.1:8983:8983"

@@ -1,0 +1,28 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Application data
+rds-config/lukida_newlibrary/
+lukida/
+
+# Database and Solr data (recreate on docker-compose up)
+# Commented out to keep persistent data during development
+# mysql_data/
+# solr_data/
+
+# Docker
+.docker/

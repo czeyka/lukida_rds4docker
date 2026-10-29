@@ -1,110 +1,214 @@
-version: '3.8'
+# Lukida Essential – docker-compose.yml
+#
+# Voraussetzung: diese Datei + .env liegen im Root des geklonten Repos
+# (also neben ui/, sql/, 5/, system/, index.php, main.php).
+# Vorher: cp .env.example .env   und Werte eintragen.
+#
+# Benötigt Docker Compose >= 2.20 mit BuildKit (Standard seit Docker 23+),
+# wegen dockerfile_inline + Dockerfile-Heredocs (# syntax=docker/dockerfile:1.7).
 
 services:
-  # MariaDB Database Service (Alpine - optimized for performance)
-  mariadb:
-    image: mariadb:11-alpine
-    container_name: lukida_mariadb
-    environment:
-      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
-      MARIADB_DATABASE: ${MARIADB_DATABASE}
-      MARIADB_USER: ${MARIADB_USER}
-      MARIADB_PASSWORD: ${MARIADB_PASSWORD}
-      MARIADB_INITIALIZATIOIN_FILES: /docker-entrypoint-initdb.d
-    ports:
-      - "${MARIADB_PORT}:3306"
-    volumes:
-      - mariadb_data:/var/lib/mysql
-      - ./init-db/mysql_import.sql:/docker-entrypoint-initdb.d/mysql_import.sql:ro
-    networks:
-      - lukida_network
-    healthcheck:
-      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost"]
-      timeout: 20s
-      retries: 10
+  db:
+    image: postgres:16-alpine
     restart: unless-stopped
-    command: --max-connections=100 --max_allowed_packet=16M
-
-  # Solr Search Service (Alpine - optimized for performance)
-  solr:
-    image: solr:9-alpine
-    container_name: lukida_solr
-    ports:
-      - "${SOLR_PORT}:8983"
     environment:
-      SOLR_JAVA_MEM: -Xms256m -Xmx512m
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - solr_data:/var/solr
-      - ./solr-config:/opt/solr-config:ro
-    networks:
-      - lukida_network
-    command: solr-foreground
+      - db-data:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      # demo-data.sql enthält Platzhalter (<solr-host>, <iln>, <paia-...>, ...),
+      # die laut README Abschnitt 5.2 erst ersetzt werden müssen. Danach:
+      # - ./sql/demo-data.sql:/docker-entrypoint-initdb.d/02-demo-data.sql:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8983/solr/admin/cores"]
-      timeout: 10s
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
       retries: 10
-    restart: unless-stopped
+    # ports:
+    #   - "5432:5432"   # nur zum lokalen Debuggen mit psql nötig
 
-  # PHP Apache Application Service
-  php-apache:
+  app:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: lukida_app
+      dockerfile_inline: |
+        # syntax=docker/dockerfile:1.7
+
+        # ---------- Stage 1: Vue-UI bauen, danach verworfen ----------
+        FROM node:20-alpine AS ui-builder
+        WORKDIR /src/ui
+        COPY ui/package*.json ./
+        RUN npm ci
+        COPY ui/ ./
+        ARG VITE_API_KEY
+        ARG VITE_APP_TITLE
+        ARG VITE_API_CLIENT
+        RUN printf 'VITE_API_KEY=%s\nVITE_APP_TITLE=%s\nVITE_API_CLIENT=%s\n' \
+              "$VITE_API_KEY" "$VITE_APP_TITLE" "$VITE_API_CLIENT" > .env.local \
+         && npm run build
+
+        # ---------- Stage 2: PHP-API + Apache (Laufzeit-Image) ----------
+        FROM php:8.4-apache AS final
+
+        ARG LUKIDA_API_KEY
+        ARG LUKIDA_STARTYEAR
+        ARG LUKIDA_AUTHOR_NAME
+        ARG LUKIDA_AUTHOR_MAIL
+        ARG LUKIDA_AUTHOR_COMPANY
+        ARG LUKIDA_AUTHOR_HOMEPAGE
+
+        RUN apt-get update \
+         && apt-get install -y --no-install-recommends libpq-dev \
+         && docker-php-ext-install pdo_pgsql pgsql \
+         && a2enmod rewrite proxy proxy_http \
+         && apt-get purge -y --auto-remove \
+         && rm -rf /var/lib/apt/lists/*
+
+        # feste Ports statt Default-80, wie im Original (9055 API, 9056 UI)
+        COPY <<'EOF' /etc/apache2/ports.conf
+        Listen 9055
+        Listen 9056
+        EOF
+
+        COPY <<'EOF' /etc/apache2/sites-available/000-default.conf
+        <VirtualHost *:9055>
+            ServerName    "LukidaEssential"
+            SetEnv MODULE "user"
+            SetEnv CLIENT "Essential"
+            SetEnv MODE   "production"
+            DocumentRoot  "/var/www/lukida-essential/"
+            <Directory    "/var/www/lukida-essential/">
+                DirectoryIndex index.php
+                AllowOverride All
+                Require all granted
+                RewriteEngine On
+                RewriteBase /
+                RewriteRule ^\.htaccess$ - [F]
+                RewriteRule ^.*\.ini$ - [F]
+                RewriteCond %{REQUEST_FILENAME} !-f
+                RewriteCond %{REQUEST_FILENAME} !-d
+                RewriteCond %{REQUEST_URI} !robots.txt
+                RewriteRule ^(.*)$ index.php?/$1 [L]
+            </Directory>
+        </VirtualHost>
+
+        <VirtualHost *:9056>
+            ServerName    "LukidaEssentialUI"
+            DocumentRoot  "/var/www/lukida-essential/ui/dist/"
+            <Directory    "/var/www/lukida-essential/ui/dist/">
+                Options -Indexes +FollowSymLinks
+                AllowOverride None
+                Require all granted
+                FallbackResource /index.html
+            </Directory>
+            ProxyPass        /api http://localhost:9055
+            ProxyPassReverse /api http://localhost:9055
+        </VirtualHost>
+        EOF
+
+        # nur was die API zur Laufzeit braucht (kein .git, sql/, ui-Quellcode, ...)
+        COPY --chown=www-data:www-data index.php main.php /var/www/lukida-essential/
+        COPY --chown=www-data:www-data 5/ /var/www/lukida-essential/5/
+        COPY --chown=www-data:www-data system/ /var/www/lukida-essential/system/
+        COPY --from=ui-builder --chown=www-data:www-data /src/ui/dist /var/www/lukida-essential/ui/dist
+
+        # configs/, logs/, caches/, transfers/ -- vom Framework fest eine Ebene ÜBER dem Repo erwartet
+        RUN mkdir -p /var/www/configs/production /var/www/logs /var/www/caches /var/www/transfers \
+         && chown -R www-data:www-data /var/www/logs /var/www/caches /var/www/transfers /var/www/configs
+
+        # application.ini: laut Projekt-README kein echtes Geheimnis (apikey steht
+        # ohnehin im ausgelieferten JS) -> darf unbedenklich im Image liegen
+        RUN <<'BUILD'
+        cat > /var/www/configs/application.ini <<EOF
+        [routes]
+        POST /@api/@module/@action=@module->@action
+
+        [application]
+        name         = Lukida Essential
+        type         = production
+        apikey       = ${LUKIDA_API_KEY}
+        path         = /var/www/lukida-essential/5/
+        versionmain  = 5
+        startyear    = ${LUKIDA_STARTYEAR}
+
+        [author]
+        name         = ${LUKIDA_AUTHOR_NAME}
+        mail         = ${LUKIDA_AUTHOR_MAIL}
+        company      = ${LUKIDA_AUTHOR_COMPANY}
+        homepage     = ${LUKIDA_AUTHOR_HOMEPAGE}
+        pepper       = lukida-essential-2026
+        EOF
+        chown www-data:www-data /var/www/configs/application.ini
+        BUILD
+
+        # user.ini enthält das DB-Passwort -> NICHT ins Image backen, sondern erst
+        # beim Containerstart aus echten Umgebungsvariablen erzeugen
+        COPY <<'EOF' /usr/local/bin/lukida-entrypoint.sh
+        #!/bin/sh
+        set -e
+
+        cat > /var/www/configs/production/user.ini <<INI
+        [db]
+        driver=pgsql
+        host=${LUKIDA_DB_HOST:-db}
+        name=${POSTGRES_DB}
+        user=${POSTGRES_USER}
+        pass=${POSTGRES_PASSWORD}
+
+        [smtp]
+        host=${LUKIDA_SMTP_HOST}
+        auth=false
+        user=
+        pass=
+        port=587
+        from=${LUKIDA_SMTP_FROM}
+        fromname=Lukida Essential
+
+        [appdebug]
+        sqq=false
+        sqd=false
+        INI
+
+        chown www-data:www-data /var/www/configs/production/user.ini
+        exec docker-php-entrypoint "$@"
+        EOF
+        RUN chmod +x /usr/local/bin/lukida-entrypoint.sh
+
+        EXPOSE 9055 9056
+        ENTRYPOINT ["/usr/local/bin/lukida-entrypoint.sh"]
+        CMD ["apache2-foreground"]
+      args:
+        VITE_API_KEY: ${LUKIDA_API_KEY}
+        VITE_APP_TITLE: ${VITE_APP_TITLE}
+        VITE_API_CLIENT: ${VITE_API_CLIENT}
+        LUKIDA_API_KEY: ${LUKIDA_API_KEY}
+        LUKIDA_STARTYEAR: ${LUKIDA_STARTYEAR}
+        LUKIDA_AUTHOR_NAME: ${LUKIDA_AUTHOR_NAME}
+        LUKIDA_AUTHOR_MAIL: ${LUKIDA_AUTHOR_MAIL}
+        LUKIDA_AUTHOR_COMPANY: ${LUKIDA_AUTHOR_COMPANY}
+        LUKIDA_AUTHOR_HOMEPAGE: ${LUKIDA_AUTHOR_HOMEPAGE}
+    restart: unless-stopped
     depends_on:
-      mariadb:
-        condition: service_healthy
-      solr:
+      db:
         condition: service_healthy
     ports:
-      - "${APP_PORT}:80"
+      - "${API_PORT}:9055"
+      - "${UI_PORT}:9056"
     environment:
-      # PHP Environment
-      PHP_ERROR_LOG: /var/log/php/error.log
-      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT}
-      PHP_MAX_POST_SIZE: ${PHP_MAX_POST_SIZE}
-      PHP_UPLOAD_MAX_FILESIZE: ${PHP_UPLOAD_MAX_FILESIZE}
-      
-      # Application Settings
-      LIBRARY: ${LIBRARY_NAME}
-      MODE: ${APP_MODE}
-      
-      # Database Connection
-      DB_TYPE: ${MARIADB_TYPE}
-      DB_HOST: mariadb
-      DB_PORT: 3306
-      DB_USER: ${MARIADB_USER}
-      DB_PASSWORD: ${MARIADB_PASSWORD}
-      DB_NAME: ${MARIADB_DATABASE}
-      
-      # Solr Connection
-      SOLR_HOST: solr
-      SOLR_PORT: 8983
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      LUKIDA_DB_HOST: db
+      LUKIDA_SMTP_HOST: ${LUKIDA_SMTP_HOST}
+      LUKIDA_SMTP_FROM: ${LUKIDA_SMTP_FROM}
     volumes:
-      # Lukida application
-      - ./lukida:/var/www/html:ro
-      
-      # Configuration (read-write for development)
-      - ./rds-config:/var/www/html/libraries/lukida_newlibrary:rw
-      
-      # Logs
-      - ./logs/apache2:/var/log/apache2:rw
-      - ./logs/php:/var/log/php:rw
-      - ./logs/lukida:/var/www/html/libraries/lukida_newlibrary/logs:rw
-      
-      # Apache vhost configuration
-      - ./apache-config/000-lukida.conf:/etc/apache2/sites-available/000-lukida.conf:ro
-      - ./apache-config/000-lukida.conf:/etc/apache2/sites-enabled/000-lukida.conf:ro
-    networks:
-      - lukida_network
-    restart: unless-stopped
-
-networks:
-  lukida_network:
-    driver: bridge
+      - api-logs:/var/www/logs
+      - api-caches:/var/www/caches
+      - api-transfers:/var/www/transfers
 
 volumes:
-  mariadb_data:
-    driver: local
-  solr_data:
-    driver: local
+  db-data:
+  api-logs:
+  api-caches:
+  api-transfers:
